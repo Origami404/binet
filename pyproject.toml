@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binet"
+version = "0.1.0"
+description = "Binary-level intra-kernel event tracing for CUDA"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "torch",
+    "cupti-python>=13.4; sys_platform == 'linux'",
+]
+
+[project.scripts]
+binet = "binet.app.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["binet*"]
+
+[tool.setuptools.package-data]
+binet = ["db/*.json.gz"]
