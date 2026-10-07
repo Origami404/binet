@@ -55,12 +55,22 @@ class _Hazards:
         # per instruction: the write claim it opens, the read claim it opens, and the scoreboards it waits on
         self.opens_wr, self.opens_rd, self.waits = [None] * n, [None] * n, [frozenset()] * n
         self.decoupled = [False] * n
+        # ptxas batches consecutive variable-latency instructions under one scoreboard
+        # claim carried by the LAST batch member; the earlier members carry no claim
+        # bits themselves (see the merge pass after this loop).
+        self.unclaimed = [None] * n
         for i, x in enumerate(instrs):
             if isinstance(x, Unknown):
                 continue
             c = x.ctrl
             self.waits[i] = c.wait | self._depbar_drains(x)
             self.decoupled[i] = x.instruction_type.startswith(DECOUPLED)
+            if self.decoupled[i] and c.wr is None and c.rd is None:
+                # A batch member without its own claim: its R sources are captured
+                # late (at execution), so they stay unread until the batch drains.
+                # Its destinations are late writes, which merely overwrite a probe
+                # store in flight -- no hazard for the probe.
+                self.unclaimed[i] = bits_of(r for r in x.reads if r.file == "R")
             if c.wr is not None:
                 # a variable-latency result means the instruction executes after it issues, so its sources
                 # are captured then, not at issue: they stay unread until this scoreboard is waited
@@ -70,6 +80,25 @@ class _Hazards:
                 # a read scoreboard protects the operands read late (store data, async sources): the
                 # register operands, never predicates, which every op consumes at issue
                 self.opens_rd[i] = (c.rd, bits_of(r for r in x.reads if r.file in ("R", "UR")))
+        # Merge every unclaimed batch member's late-captured sources into the next
+        # claim opener, so they stay pending on that scoreboard until it is waited.
+        # The LSU completes in order, so a wait on a DIFFERENT scoreboard cannot
+        # prove this batch drained -- only the batch's own wait can, hence no wider
+        # drain. A wait before any opener follows drains whatever preceded it.
+        carry = 0
+        for i in range(n):
+            if self.waits[i]:
+                carry = 0
+            if self.unclaimed[i]:
+                carry |= self.unclaimed[i]
+            if self.opens_wr[i] is not None:
+                sb, regs = self.opens_wr[i]
+                self.opens_wr[i] = (sb, regs | carry)
+                carry = 0
+            elif self.opens_rd[i] is not None:
+                sb, regs = self.opens_rd[i]
+                self.opens_rd[i] = (sb, regs | carry)
+                carry = 0
 
     def _annotate_sites(self):
         for b in self.cfg.blocks:
