@@ -1,4 +1,5 @@
 """Offline kernel injection: buffer setup, probe emission, and image construction."""
+import os
 from dataclasses import dataclass
 from functools import partial
 import hashlib
@@ -38,7 +39,9 @@ class InjectedKernel:
 
 def _record_quad(site):
     mask = site.free_regs or 0
-    return next((r for r in range(0, liveness.WIDTH["R"], 4) if (mask >> r) & 15 == 15), None)
+    exclude = {int(x) for x in os.environ.get("BINET_QUAD_EXCLUDE", "").split(",") if x}
+    return next((r for r in range(0, liveness.WIDTH["R"], 4)
+                 if r not in exclude and (mask >> r) & 15 == 15), None)
 
 
 def check_site(cfg, site):
@@ -146,7 +149,11 @@ class _Injector:
 
     def _scoreboard_at(self, i):
         mask = self.cfg.sites[i].free_scoreboards
-        return (mask & -mask).bit_length() - 1 if mask else None
+        if not mask:
+            return None
+        if i and os.environ.get("BINET_SB_HIGH"):
+            return mask.bit_length() - 1
+        return (mask & -mask).bit_length() - 1
 
     def _uniform_regs(self):
         """Persistent ring state must remain free and untouched throughout reachable code."""
@@ -233,6 +240,26 @@ class _Injector:
         ]
 
     def _record(self, base, counter, addr, quad, tag, sb, cta_id, predicate):
+        mode = os.environ.get("BINET_PROBE_MODE", "store")
+        if mode != "store":
+            b, math = self.isa, _ctrl()
+            base, counter, addr = map(UR, (base, counter, addr))
+            urz = UR(self.isa.zero["UR"])
+            guard = P(predicate)
+            body = [b.ELECT(guard, urz, ctrl=math),
+                    b.ULOP3(addr, counter, self.ring_depth - 1, urz, AND_LUT, UP(PT),
+                            mods=("LUT",), ctrl=math)]
+            if mode in ("w8", "w9"):
+                which = 8 if mode == "w8" else 9
+                body.append(b.MOV(R(quad + which - 8), tag, guard=guard, ctrl=math))
+            elif mode in ("w1011",):
+                body.append(b.CS2R(R(quad + 2), "SR_GLOBALTIMERLO", guard=guard,
+                                   ctrl=_ctrl(TIMER_STALL)))
+            elif mode in ("w89",):
+                body.append(b.MOV(R(quad), tag, guard=guard, ctrl=math))
+                body.append(b.MOV(R(quad + 1), cta_id, guard=guard, ctrl=math))
+            return body
+        # 完整探针（原路径）
         # One store, one read barrier: its wait protects kernel GPR reuse and
         # the next probe's address rewrite. The per-warp counter advances once
         # through the uniform datapath, whose guard is UP rather than lane P.
