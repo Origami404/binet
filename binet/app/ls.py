@@ -23,6 +23,31 @@ def ls(command):
     return status if status >= 0 else 128 - status
 
 
+def _launch_metadata(event):
+    """Return grid/block metadata for one GPU kernel event, or None.
+
+    Torch 2.10 removed activity_type()/extra_meta(); fall back to device_type()
+    plus metadata_json, whose pretty-printed fragment carries grid and block.
+    """
+    import json
+
+    activity = getattr(event, "activity_type", None)
+    if activity is not None:
+        if activity() != "kernel":
+            return None
+        metadata = event.extra_meta()
+    else:
+        from torch.autograd import DeviceType
+
+        if event.device_type() != DeviceType.CUDA or event.duration_ns() <= 0:
+            return None
+        raw = event.metadata_json()
+        if '"grid"' not in raw or '"block"' not in raw:
+            return None
+        metadata = json.loads("{" + raw + "}")
+    return metadata
+
+
 def _run(script, args):
     import torch
     from torch.profiler import profile, ProfilerActivity, _ExperimentalConfig
@@ -41,11 +66,12 @@ def _run(script, args):
     # Kineto exposes launch metadata directly; no trace export is needed.
     launches = set()
     for event in prof.profiler.kineto_results.events():
-        if event.activity_type() == "kernel":
-            metadata = event.extra_meta()
-            grid = tuple(json.loads(metadata["grid"]))
-            block = tuple(json.loads(metadata["block"]))
-            launches.add((event.name(), grid, block))
+        metadata = _launch_metadata(event)
+        if metadata is None:
+            continue
+        grid = tuple(json.loads(metadata["grid"]) if isinstance(metadata["grid"], str) else metadata["grid"])
+        block = tuple(json.loads(metadata["block"]) if isinstance(metadata["block"], str) else metadata["block"])
+        launches.add((event.name(), grid, block))
     for name, grid, block in sorted(launches):
         print(f"{name}\tgrid={grid}\tblock={block}")
     if not launches:
